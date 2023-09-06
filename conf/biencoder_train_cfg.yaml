@@ -1,7 +1,7 @@
 
 # configuration groups
 defaults:
-  - encoder: hf_bert
+  - encoder: hf_t5
   - train: biencoder_default
   - datasets: encoder_train_default
 
@@ -16,7 +16,7 @@ do_lower_case: True
 
 val_av_rank_start_epoch: 30
 seed: 12345
-checkpoint_file_name: dpr_biencoder
+checkpoint_file_name: gtr_diverse_biencoder
 
 # A trained bi-encoder checkpoint file to initialize the model
 model_file:

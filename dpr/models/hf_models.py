@@ -17,20 +17,15 @@ import transformers
 from torch import Tensor as T
 from torch import nn
 
-
-if transformers.__version__.startswith("4"):
-    from transformers import BertConfig, BertModel
-    from transformers import AdamW
-    from transformers import BertTokenizer
-    from transformers import RobertaTokenizer
-else:
-    from transformers.modeling_bert import BertConfig, BertModel
-    from transformers.optimization import AdamW
-    from transformers.tokenization_bert import BertTokenizer
-    from transformers.tokenization_roberta import RobertaTokenizer
+from transformers import BertConfig, BertModel
+from transformers import T5Config, T5EncoderModel
+from transformers import AdamW
+from transformers import BertTokenizer
+from transformers import T5Tokenizer
+from transformers import RobertaTokenizer
 
 from dpr.utils.data_utils import Tensorizer
-from dpr.models.biencoder import BiEncoder
+from dpr.models.biencoder import BiEncoder, DiverseBiEncoder
 from .reader import Reader
 
 logger = logging.getLogger(__name__)
@@ -68,6 +63,42 @@ def get_bert_biencoder_components(cfg, inference_only: bool = False, **kwargs):
     )
 
     tensorizer = get_bert_tensorizer(cfg)
+    return tensorizer, biencoder, optimizer
+
+
+def get_t5_biencoder_components(cfg, inference_only: bool = False, **kwargs):
+    dropout = cfg.encoder.dropout if hasattr(cfg.encoder, "dropout") else 0.0
+    question_encoder = HFT5Encoder.init_encoder(
+        cfg.encoder.pretrained_model_cfg,
+        projection_dim=cfg.encoder.projection_dim,
+        k=cfg.encoder.k,
+        dropout=dropout,
+        pretrained=cfg.encoder.pretrained,
+        **kwargs
+    )
+    ctx_encoder = HFT5Encoder.init_encoder(
+        cfg.encoder.pretrained_model_cfg,
+        projection_dim=cfg.encoder.projection_dim,
+        dropout=dropout,
+        pretrained=cfg.encoder.pretrained,
+        **kwargs
+    )
+
+    fix_ctx_encoder = cfg.encoder.fix_ctx_encoder if hasattr(cfg.encoder, "fix_ctx_encoder") else False
+    biencoder = DiverseBiEncoder(question_encoder, ctx_encoder, fix_ctx_encoder=fix_ctx_encoder, k=cfg.encoder.k)
+
+    optimizer = (
+        get_optimizer(
+            biencoder,
+            learning_rate=cfg.train.learning_rate,
+            adam_eps=cfg.train.adam_eps,
+            weight_decay=cfg.train.weight_decay,
+        )
+        if not inference_only
+        else None
+    )
+
+    tensorizer = get_t5_tensorizer(cfg)
     return tensorizer, biencoder, optimizer
 
 
@@ -117,6 +148,16 @@ def get_bert_tensorizer_p(
     if special_tokens:
         _add_special_tokens(tokenizer, special_tokens)
     return BertTensorizer(tokenizer, sequence_length)
+
+
+def get_t5_tensorizer(cfg):
+    sequence_length = cfg.encoder.sequence_length
+    pretrained_model_cfg = cfg.encoder.pretrained_model_cfg
+    tokenizer = get_t5_tokenizer(pretrained_model_cfg, do_lower_case=cfg.do_lower_case)
+    if cfg.special_tokens:
+        _add_special_tokens(tokenizer, cfg.special_tokens)
+
+    return T5Tensorizer(tokenizer, sequence_length)
 
 
 def _add_special_tokens(tokenizer, special_tokens):
@@ -189,6 +230,10 @@ def get_optimizer_grouped(
 
 def get_bert_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
     return BertTokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
+
+
+def get_t5_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
+    return T5Tokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
 
 
 def get_roberta_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
@@ -272,8 +317,157 @@ class HFBertEncoder(BertModel):
         return self.config.hidden_size
 
 
+'''
+Keep as rand init for now, and then when run 
+there will be some error that we can follow
+'''
+class HFT5Encoder(T5EncoderModel):
+    def __init__(self, config, project_dim: int = 0, k: int = 1):
+        T5EncoderModel.__init__(self, config)
+        assert config.d_model > 0, "Encoder d_model can't be zero"
+        self.encode_proj = nn.Linear(config.d_model, project_dim * k) if project_dim != 0 else None
+        self.init_weights()
+
+    @classmethod
+    def init_encoder(
+        cls, cfg_name: str, projection_dim: int = 0, k: int = 1, dropout: float = 0.1, pretrained: bool = True, **kwargs
+    ) -> T5EncoderModel:
+        logger.info("Initializing HF T5 Encoder. cfg_name=%s", cfg_name)
+        cfg = T5Config.from_pretrained(cfg_name if cfg_name else "t5-base")
+        if dropout != 0:
+            cfg.attention_probs_dropout_prob = dropout
+            cfg.hidden_dropout_prob = dropout
+
+        if pretrained:
+            return cls.from_pretrained(cfg_name, config=cfg, project_dim=projection_dim, k=k, **kwargs)
+        else:
+            return HFT5Encoder(cfg, project_dim=projection_dim, k=k)
+
+    def forward(
+        self,
+        input_ids: T,
+        token_type_ids: T,
+        attention_mask: T,
+        representation_token_pos=0,
+    ) -> Tuple[T, ...]:
+
+        out = super().forward(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+        )
+
+        # HF >4.0 version support
+        if transformers.__version__.startswith("4") and isinstance(
+            out,
+            transformers.modeling_outputs.BaseModelOutputWithPoolingAndCrossAttentions,
+        ):
+            sequence_output = out.last_hidden_state
+            pooled_output = None
+            hidden_states = out.hidden_states
+
+        elif self.config.output_hidden_states:
+            sequence_output, pooled_output, hidden_states = out
+        else:
+            hidden_states = None
+            out = super().forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+            )
+            sequence_output, pooled_output = out
+
+        # TODO: mean pooling
+        output_vectors = []
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(pooled_output.size()).float()
+        sum_embeddings = torch.sum(pooled_output * input_mask_expanded, 1)
+
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+
+        output_vectors.append(sum_embeddings / sum_mask)
+        pooled_output = torch.cat(output_vectors, 1)
+
+        if self.encode_proj:
+            pooled_output = self.encode_proj(pooled_output)
+        return sequence_output, pooled_output, hidden_states
+
+    # TODO: make a super class for all encoders
+    def get_out_size(self):
+        if self.encode_proj:
+            return self.encode_proj.out_features
+        return self.config.hidden_size
+
+
 class BertTensorizer(Tensorizer):
     def __init__(self, tokenizer: BertTokenizer, max_length: int, pad_to_max: bool = True):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_to_max = pad_to_max
+
+    def text_to_tensor(
+        self,
+        text: str,
+        title: str = None,
+        add_special_tokens: bool = True,
+        apply_max_len: bool = True,
+    ):
+        text = text.strip()
+        # tokenizer automatic padding is explicitly disabled since its inconsistent behavior
+        # TODO: move max len to methods params?
+
+        if title:
+            token_ids = self.tokenizer.encode(
+                title,
+                text_pair=text,
+                add_special_tokens=add_special_tokens,
+                max_length=self.max_length if apply_max_len else 10000,
+                pad_to_max_length=False,
+                truncation=True,
+            )
+        else:
+            token_ids = self.tokenizer.encode(
+                text,
+                add_special_tokens=add_special_tokens,
+                max_length=self.max_length if apply_max_len else 10000,
+                pad_to_max_length=False,
+                truncation=True,
+            )
+
+        seq_len = self.max_length
+        if self.pad_to_max and len(token_ids) < seq_len:
+            token_ids = token_ids + [self.tokenizer.pad_token_id] * (seq_len - len(token_ids))
+        if len(token_ids) >= seq_len:
+            token_ids = token_ids[0:seq_len] if apply_max_len else token_ids
+            token_ids[-1] = self.tokenizer.sep_token_id
+
+        return torch.tensor(token_ids)
+
+    def get_pair_separator_ids(self) -> T:
+        return torch.tensor([self.tokenizer.sep_token_id])
+
+    def get_pad_id(self) -> int:
+        return self.tokenizer.pad_token_id
+
+    def get_attn_mask(self, tokens_tensor: T) -> T:
+        return tokens_tensor != self.get_pad_id()
+
+    def is_sub_word_id(self, token_id: int):
+        token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+        return token.startswith("##") or token.startswith(" ##")
+
+    def to_string(self, token_ids, skip_special_tokens=True):
+        return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def set_pad_to_max(self, do_pad: bool):
+        self.pad_to_max = do_pad
+
+    def get_token_id(self, token: str) -> int:
+        return self.tokenizer.vocab[token]
+
+
+class T5Tensorizer(Tensorizer):
+    def __init__(self, tokenizer: T5Tokenizer, max_length: int, pad_to_max: bool = True):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.pad_to_max = pad_to_max

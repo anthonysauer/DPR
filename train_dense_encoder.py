@@ -25,7 +25,7 @@ from torch import Tensor as T
 from torch import nn
 
 from dpr.models import init_biencoder_components
-from dpr.models.biencoder import BiEncoderNllLoss, BiEncoderBatch
+from dpr.models.biencoder import BiEncoderNllLoss, DiverseBiEncoderNllLoss, BiEncoderBatch
 from dpr.options import (
     setup_cfg_gpu,
     set_seed,
@@ -207,7 +207,9 @@ class BiEncoderTrainer(object):
             validation_loss = 0
         else:
             if epoch >= cfg.val_av_rank_start_epoch:
-                validation_loss = self.validate_average_rank()
+                # TODO: revert change once validate_average_rank() uses diverse loss function
+                # validation_loss = self.validate_average_rank()
+                validation_loss = self.validate_nll()
             else:
                 validation_loss = self.validate_nll()
 
@@ -291,6 +293,7 @@ class BiEncoderTrainer(object):
         )
         return total_loss
 
+    # TODO: use diverse loss function instead
     def validate_average_rank(self) -> float:
         """
         Validates biencoder model using each question's gold passage's rank across the set of passages from the dataset.
@@ -724,7 +727,7 @@ def _do_biencoder_fwd_pass(
 
     local_q_vector, local_ctx_vectors = model_out
 
-    loss_function = BiEncoderNllLoss()
+    loss_function = DiverseBiEncoderNllLoss()
 
     loss, is_correct = _calc_loss(
         cfg,

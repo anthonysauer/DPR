@@ -59,6 +59,17 @@ def cosine_scores(q_vector: T, ctx_vectors: T):
     return F.cosine_similarity(q_vector, ctx_vectors, dim=1)
 
 
+def cosine_scores_multi(q_vector: T, ctx_vectors: T):
+    # q_vector: n1 x kD, ctx_vectors: n2 x D, result n1 x k x n2
+    # q_vector: (n1*k) x D
+    n2, hidden_size = ctx_vectors.shape
+    n1, q_hidden_size = q_vector.shape
+    k = q_hidden_size / hidden_size
+    q_vector_r = q_vector.view(n1 * k, hidden_size)
+    simple_cosine = F.cosine_similarity(q_vector_r, ctx_vectors, dim=1)  # simple_cosine: (n1*k) x n2
+    return simple_cosine.view(n1, k, n2)
+
+
 class BiEncoder(nn.Module):
     """Bi-Encoder model component. Encapsulates query/question and context/passage encoders."""
 
@@ -251,6 +262,141 @@ class BiEncoder(nn.Module):
         return self.state_dict()
 
 
+class DiverseBiEncoder(BiEncoder):
+    """Diverse Bi-Encoder model component. Encapsulates query/question and context/passage encoders."""
+
+    def __init__(
+        self,
+        question_model: nn.Module,
+        ctx_model: nn.Module,
+        fix_q_encoder: bool = False,
+        fix_ctx_encoder: bool = False,
+        k: int = 1,
+    ):
+        super(DiverseBiEncoder, self).__init__(
+            question_model=question_model,
+            ctx_model=ctx_model,
+            fix_q_encoder=fix_q_encoder,
+            fix_ctx_encoder=fix_ctx_encoder,
+        )
+        self.k = k
+
+    def create_biencoder_input(
+        self,
+        samples: List[BiEncoderSample],
+        tensorizer: Tensorizer,
+        insert_title: bool,
+        num_hard_negatives: int = 0,
+        num_other_negatives: int = 0,
+        shuffle: bool = True,
+        shuffle_positives: bool = False,
+        hard_neg_fallback: bool = True,
+        query_token: str = None,
+    ) -> BiEncoderBatch:
+        """
+        Creates a batch of the biencoder training tuple.
+        :param samples: list of BiEncoderSample-s to create the batch for
+        :param tensorizer: components to create model input tensors from a text sequence
+        :param insert_title: enables title insertion at the beginning of the context sequences
+        :param num_hard_negatives: amount of hard negatives per question (taken from samples' pools)
+        :param num_other_negatives: amount of other negatives per question (taken from samples' pools)
+        :param shuffle: shuffles negative passages pools
+        :param shuffle_positives: shuffles positive passages pools
+        :return: BiEncoderBatch tuple
+        """
+        question_tensors = []
+        ctx_tensors = []
+        positive_ctx_indices = []
+        hard_neg_ctx_indices = []
+
+        for sample in samples:
+            # [ctx+] & [ctx-] composition
+            # as of now, take all ctx+
+
+            # TODO: do we want to use all ctx+ or just k? what to do when #ctx+ < k?
+            positive_ctxs = sample.positive_passages
+            if len(positive_ctxs) < self.k:
+                continue
+
+            if shuffle_positives:
+                random.shuffle(positive_ctxs)
+
+            positive_ctxs = positive_ctxs[0:self.k]
+
+            neg_ctxs = sample.negative_passages
+            hard_neg_ctxs = sample.hard_negative_passages
+            question = sample.query
+            # question = normalize_question(sample.query)
+
+            if shuffle:
+                random.shuffle(neg_ctxs)
+                random.shuffle(hard_neg_ctxs)
+
+            if hard_neg_fallback and len(hard_neg_ctxs) == 0:
+                hard_neg_ctxs = neg_ctxs[0:num_hard_negatives]
+
+            neg_ctxs = neg_ctxs[0:num_other_negatives]
+            hard_neg_ctxs = hard_neg_ctxs[0:num_hard_negatives]
+
+            all_ctxs = positive_ctxs + neg_ctxs + hard_neg_ctxs
+            hard_negatives_start_idx = len(positive_ctxs)
+            hard_negatives_end_idx = hard_negatives_start_idx + len(hard_neg_ctxs)
+
+            current_ctxs_len = len(ctx_tensors)
+
+            sample_ctxs_tensors = [
+                tensorizer.text_to_tensor(ctx.text, title=ctx.title if (insert_title and ctx.title) else None)
+                for ctx in all_ctxs
+            ]
+
+            ctx_tensors.extend(sample_ctxs_tensors)
+            positive_ctx_indices.append(
+                [
+                    i
+                    for i in range(
+                        current_ctxs_len,
+                        current_ctxs_len + hard_negatives_start_idx,
+                    )
+                ]
+            )
+            hard_neg_ctx_indices.append(
+                [
+                    i
+                    for i in range(
+                        current_ctxs_len + hard_negatives_start_idx,
+                        current_ctxs_len + hard_negatives_end_idx,
+                    )
+                ]
+            )
+
+            # TODO: figure out where query_token is being set
+            assert not query_token
+            if query_token:
+                if query_token == "[START_ENT]":
+                    query_span = _select_span_with_token(question, tensorizer, token_str=query_token)
+                    question_tensors.append(query_span)
+                else:
+                    question_tensors.append(tensorizer.text_to_tensor(" ".join([query_token, question])))
+            else:
+                question_tensors.append(tensorizer.text_to_tensor(question))
+
+        ctxs_tensor = torch.cat([ctx.view(1, -1) for ctx in ctx_tensors], dim=0)
+        questions_tensor = torch.cat([q.view(1, -1) for q in question_tensors], dim=0)
+
+        ctx_segments = torch.zeros_like(ctxs_tensor)
+        question_segments = torch.zeros_like(questions_tensor)
+
+        return BiEncoderBatch(
+            questions_tensor,
+            question_segments,
+            ctxs_tensor,
+            ctx_segments,
+            positive_ctx_indices,
+            hard_neg_ctx_indices,
+            "question",
+        )
+
+
 class BiEncoderNllLoss(object):
     def calc(
         self,
@@ -296,6 +442,62 @@ class BiEncoderNllLoss(object):
     @staticmethod
     def get_similarity_function():
         return dot_product_scores
+
+
+class DiverseBiEncoderNllLoss(object):
+    def calc(
+            self,
+            q_vectors: T,
+            ctx_vectors: T,
+            positive_idx_per_question: list,
+            hard_negative_idx_per_question: list = None,
+            loss_scale: float = None,
+    ) -> Tuple[T, int]:
+        """
+        Computes nll loss for the given lists of question and ctx vectors.
+        Note that although hard_negative_idx_per_question in not currently in use, one can use it for the
+        loss modifications. For example - weighted NLL with different factors for hard vs regular negatives.
+        :return: a tuple of loss value and amount of correct predictions per batch
+        """
+        scores = self.get_scores(q_vectors, ctx_vectors)  # n1 x k x n2
+
+        max_sim_scores, max_sim_indices = torch.max(scores, dim=1)  # n1 x n2
+
+        loss = torch.Tensor([0])
+        correct_predictions_count = 0
+        for i in range(len(positive_idx_per_question)):
+            one_positive_idx = torch.LongTensor(positive_idx_per_question[i])
+            one_numerator = torch.sum(torch.exp(max_sim_scores[i, one_positive_idx]))
+
+            # flat_scores = scores.view(scores.shape[0], -1)  # n1 x k*n2
+            all_negative_mask = torch.ones((scores.shape[1], scores.shape[2]), dtype=torch.bool)
+            all_negative_mask[:, one_positive_idx] = 0
+            one_denominator = torch.sum(torch.exp(torch.masked_select(scores[i], all_negative_mask)))
+            one_denominator = one_denominator + one_numerator
+
+            loss -= torch.log(one_numerator / one_denominator)
+
+            is_correct_prediction = torch.min(max_sim_scores[i, one_positive_idx]) > torch.max(
+                torch.masked_select(scores[i], all_negative_mask))
+            if is_correct_prediction:
+                correct_predictions_count += 1
+
+        loss /= scores.shape[0]  # to convert sum to mean
+        correct_predictions_count = torch.Tensor([correct_predictions_count])
+
+        if loss_scale:
+            loss.mul_(loss_scale)
+
+        return loss, correct_predictions_count
+
+    @staticmethod
+    def get_scores(q_vector: T, ctx_vectors: T) -> T:
+        f = DiverseBiEncoderNllLoss.get_similarity_function()
+        return f(q_vector, ctx_vectors)
+
+    @staticmethod
+    def get_similarity_function():
+        return cosine_scores_multi
 
 
 def _select_span_with_token(text: str, tensorizer: Tensorizer, token_str: str = "[START_ENT]") -> T:
