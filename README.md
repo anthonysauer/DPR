@@ -72,6 +72,11 @@ git clone git@github.com:facebookresearch/DPR.git
 cd DPR
 pip install .
 ```
+Additional setup needed to get diverse biencoder training working:
+```bash
+python -m spacy download en_core_web_sm
+pip install sentencepiece
+```
 
 DPR is tested on Python 3.6+ and PyTorch 1.2.0+.
 DPR relies on third-party libraries for encoder code implementations.
