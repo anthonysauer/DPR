@@ -4,6 +4,10 @@ ambigqa_train:
   _target_: dpr.data.biencoder_data.JsonQADataset
   file: data.retriever.ambigqa-train
 
+ambigqa_dev:
+  _target_: dpr.data.biencoder_data.JsonQADataset
+  file: data.retriever.ambigqa-dev
+
 nq_train:
   _target_: dpr.data.biencoder_data.JsonQADataset
   file: data.retriever.nq-train
