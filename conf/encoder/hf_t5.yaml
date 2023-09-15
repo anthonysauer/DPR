@@ -13,7 +13,7 @@ pretrained_file:
 projection_dim: 768
 
 # Max length of the encoder input sequence
-sequence_length: 360
+sequence_length: 512
 
 dropout: 0.1
 

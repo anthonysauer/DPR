@@ -16,16 +16,15 @@ import torch
 import transformers
 from torch import Tensor as T
 from torch import nn
-
-from transformers import BertConfig, BertModel
-from transformers import T5Config, T5EncoderModel
 from transformers import AdamW
+from transformers import BertConfig, BertModel
 from transformers import BertTokenizer
-from transformers import T5Tokenizer
 from transformers import RobertaTokenizer
+from transformers import T5Config, T5EncoderModel
+from transformers import T5Tokenizer
 
-from dpr.utils.data_utils import Tensorizer
 from dpr.models.biencoder import BiEncoder, DiverseBiEncoder
+from dpr.utils.data_utils import Tensorizer
 from .reader import Reader
 
 logger = logging.getLogger(__name__)
@@ -325,6 +324,10 @@ class HFT5Encoder(T5EncoderModel):
     def __init__(self, config, project_dim: int = 0, k: int = 1):
         T5EncoderModel.__init__(self, config)
         assert config.d_model > 0, "Encoder d_model can't be zero"
+        # TODO: remove freezing once rest of pipeline is verified
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
         self.encode_proj = nn.Linear(config.d_model, project_dim * k) if project_dim != 0 else None
         self.init_weights()
 
@@ -353,7 +356,6 @@ class HFT5Encoder(T5EncoderModel):
 
         out = super().forward(
             input_ids=input_ids,
-            token_type_ids=token_type_ids,
             attention_mask=attention_mask,
         )
 
@@ -366,18 +368,19 @@ class HFT5Encoder(T5EncoderModel):
             pooled_output = None
             hidden_states = out.hidden_states
 
+        # TODO: no pooled_output in T5EncoderModel
         elif self.config.output_hidden_states:
-            sequence_output, pooled_output, hidden_states = out
+            sequence_output, hidden_states = out
         else:
             hidden_states = None
             out = super().forward(
                 input_ids=input_ids,
-                token_type_ids=token_type_ids,
                 attention_mask=attention_mask,
             )
-            sequence_output, pooled_output = out
+            sequence_output = out.last_hidden_state
 
         # TODO: mean pooling
+        pooled_output = sequence_output
         output_vectors = []
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(pooled_output.size()).float()
         sum_embeddings = torch.sum(pooled_output * input_mask_expanded, 1)
@@ -416,6 +419,7 @@ class BertTensorizer(Tensorizer):
         # tokenizer automatic padding is explicitly disabled since its inconsistent behavior
         # TODO: move max len to methods params?
 
+        # TODO: HF warning about 'longest_first' truncation
         if title:
             token_ids = self.tokenizer.encode(
                 title,
@@ -504,10 +508,6 @@ class T5Tensorizer(Tensorizer):
         seq_len = self.max_length
         if self.pad_to_max and len(token_ids) < seq_len:
             token_ids = token_ids + [self.tokenizer.pad_token_id] * (seq_len - len(token_ids))
-        if len(token_ids) >= seq_len:
-            token_ids = token_ids[0:seq_len] if apply_max_len else token_ids
-            token_ids[-1] = self.tokenizer.sep_token_id
-
         return torch.tensor(token_ids)
 
     def get_pair_separator_ids(self) -> T:
