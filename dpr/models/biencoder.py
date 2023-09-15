@@ -54,9 +54,34 @@ def dot_product_scores(q_vectors: T, ctx_vectors: T) -> T:
     return r
 
 
+# TODO: double check with Ameya
+def cos_sim(a: T, b: T):
+    """
+    Function from sentence-transformers
+
+    Computes the cosine similarity cos_sim(a[i], b[j]) for all i and j.
+    :return: Matrix with res[i][j]  = cos_sim(a[i], b[j])
+    """
+    if not isinstance(a, torch.Tensor):
+        a = torch.tensor(a)
+
+    if not isinstance(b, torch.Tensor):
+        b = torch.tensor(b)
+
+    if len(a.shape) == 1:
+        a = a.unsqueeze(0)
+
+    if len(b.shape) == 1:
+        b = b.unsqueeze(0)
+
+    a_norm = F.normalize(a, p=2, dim=1)
+    b_norm = F.normalize(b, p=2, dim=1)
+    return torch.mm(a_norm, b_norm.transpose(0, 1))
+
+
 def cosine_scores(q_vector: T, ctx_vectors: T):
     # q_vector: n1 x D, ctx_vectors: n2 x D, result n1 x n2
-    return F.cosine_similarity(q_vector, ctx_vectors, dim=1)
+    return cos_sim(q_vector, ctx_vectors)
 
 
 def cosine_scores_multi(q_vector: T, ctx_vectors: T):
@@ -64,10 +89,10 @@ def cosine_scores_multi(q_vector: T, ctx_vectors: T):
     # q_vector: (n1*k) x D
     n2, hidden_size = ctx_vectors.shape
     n1, q_hidden_size = q_vector.shape
-    k = q_hidden_size / hidden_size
-    q_vector_r = q_vector.view(n1 * k, hidden_size)
-    simple_cosine = F.cosine_similarity(q_vector_r, ctx_vectors, dim=1)  # simple_cosine: (n1*k) x n2
-    return simple_cosine.view(n1, k, n2)
+    k = q_hidden_size // hidden_size
+    q_vector_r = torch.reshape(q_vector, (n1 * k, hidden_size))
+    simple_cosine = cos_sim(q_vector_r, ctx_vectors)  # simple_cosine: (n1*k) x n2
+    return torch.reshape(simple_cosine, (n1, k, n2))
 
 
 class BiEncoder(nn.Module):
@@ -313,15 +338,16 @@ class DiverseBiEncoder(BiEncoder):
             # [ctx+] & [ctx-] composition
             # as of now, take all ctx+
 
-            # TODO: do we want to use all ctx+ or just k? what to do when #ctx+ < k?
             positive_ctxs = sample.positive_passages
-            if len(positive_ctxs) < self.k:
-                continue
-
             if shuffle_positives:
                 random.shuffle(positive_ctxs)
 
+            # TODO: do we want to use all ctx+ or just k? what to do when #ctx+ < k?
+            '''
+            if len(positive_ctxs) < self.k:
+                continue
             positive_ctxs = positive_ctxs[0:self.k]
+            '''
 
             neg_ctxs = sample.negative_passages
             hard_neg_ctxs = sample.hard_negative_passages
@@ -463,14 +489,15 @@ class DiverseBiEncoderNllLoss(object):
 
         max_sim_scores, max_sim_indices = torch.max(scores, dim=1)  # n1 x n2
 
-        loss = torch.Tensor([0])
+        # TODO: check with Ameya about the .to() calls
+        loss = torch.Tensor([0]).to(max_sim_indices.device)
         correct_predictions_count = 0
         for i in range(len(positive_idx_per_question)):
-            one_positive_idx = torch.LongTensor(positive_idx_per_question[i])
+            one_positive_idx = torch.LongTensor(positive_idx_per_question[i]).to(loss.device)
             one_numerator = torch.sum(torch.exp(max_sim_scores[i, one_positive_idx]))
 
             # flat_scores = scores.view(scores.shape[0], -1)  # n1 x k*n2
-            all_negative_mask = torch.ones((scores.shape[1], scores.shape[2]), dtype=torch.bool)
+            all_negative_mask = torch.ones((scores.shape[1], scores.shape[2]), dtype=torch.bool).to(loss.device)
             all_negative_mask[:, one_positive_idx] = 0
             one_denominator = torch.sum(torch.exp(torch.masked_select(scores[i], all_negative_mask)))
             one_denominator = one_denominator + one_numerator
@@ -483,7 +510,7 @@ class DiverseBiEncoderNllLoss(object):
                 correct_predictions_count += 1
 
         loss /= scores.shape[0]  # to convert sum to mean
-        correct_predictions_count = torch.Tensor([correct_predictions_count])
+        correct_predictions_count = torch.Tensor([correct_predictions_count]).to(loss.device)
 
         if loss_scale:
             loss.mul_(loss_scale)
